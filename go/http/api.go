@@ -308,9 +308,13 @@ func (this *HttpAPI) ForgetCluster(params martini.Params, r render.Render, req *
 	}
 
 	if orcraft.IsRaftEnabled() {
-		orcraft.PublishCommand("forget-cluster", clusterName)
+		_, err = orcraft.PublishCommand("forget-cluster", clusterName)
 	} else {
-		inst.ForgetCluster(clusterName)
+		err = inst.ForgetCluster(clusterName)
+	}
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
 	}
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Cluster forgotten: %+v", clusterName)})
 }

@@ -1120,9 +1120,9 @@ func (this byNamePort) Less(i, j int) bool {
 }
 
 // BulkReadInstance returns a list of all instances from the database
-// - I only need the Hostname and Port fields.
-// - I must use readInstancesByCondition to ensure all column
-//   settings are correct.
+//   - I only need the Hostname and Port fields.
+//   - I must use readInstancesByCondition to ensure all column
+//     settings are correct.
 func BulkReadInstance() ([](*InstanceKey), error) {
 	// no condition (I want all rows) and no sorting (but this is done by Hostname, Port anyway)
 	const (
@@ -2662,6 +2662,37 @@ func mkInsertOdkuForInstances(instances []*Instance, instanceWasActuallyFound bo
 const tooManyPlaceholders = "Error 1390: Prepared statement contains too many placeholders"
 
 func writeManyInstances(instances []*Instance, instanceWasActuallyFound bool, updateLastSeen bool) error {
+	// Buffered flushes can contain multiple clusters. Write each cluster separately
+	// so no operation holds locks for unrelated clusters while waiting on a forget.
+	clusters := make(map[string][]*Instance)
+	for _, instance := range instances {
+		clusters[instance.ClusterName] = append(clusters[instance.ClusterName], instance)
+	}
+	names := make([]string, 0, len(clusters))
+	for name := range clusters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := writeClusterInstances(name, clusters[name], instanceWasActuallyFound, updateLastSeen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeClusterInstances(clusterName string, instances []*Instance, instanceWasActuallyFound bool, updateLastSeen bool) error {
+	// Always acquire cluster locks before instance locks. The instance locks also
+	// protect forget-instance and results whose cluster name changed during polling.
+	releaseCluster := instanceWriteLocks.acquire([]string{clusterWriteLockKey(clusterName)}, false)
+	defer releaseCluster()
+	keys := make([]string, 0, len(instances))
+	for _, instance := range instances {
+		keys = append(keys, instanceWriteLockKey(&instance.Key))
+	}
+	releaseInstances := instanceWriteLocks.acquire(keys, false)
+	defer releaseInstances()
+
 	writeInstances := [](*Instance){}
 	for _, instance := range instances {
 		if InstanceIsForgotten(&instance.Key) && !instance.IsSeed() {
@@ -2854,6 +2885,17 @@ func ForgetInstance(instanceKey *InstanceKey) error {
 	if instanceKey == nil {
 		return log.Errorf("ForgetInstance(): nil instanceKey")
 	}
+	if err := forgetInstanceRecord(instanceKey); err != nil {
+		return err
+	}
+	AuditOperation("forget", instanceKey, "")
+	return nil
+}
+
+func forgetInstanceRecord(instanceKey *InstanceKey) error {
+	release := instanceWriteLocks.acquire([]string{instanceWriteLockKey(instanceKey)}, true)
+	defer release()
+
 	forgetInstanceKeys.Set(instanceKey.StringCode(), true, cache.DefaultExpiration)
 	sqlResult, err := db.ExecOrchestrator(`
 			delete
@@ -2873,23 +2915,41 @@ func ForgetInstance(instanceKey *InstanceKey) error {
 	if rows == 0 {
 		return log.Errorf("ForgetInstance(): instance %+v not found", *instanceKey)
 	}
-	AuditOperation("forget", instanceKey, "")
 	return nil
 }
 
-// ForgetInstance removes an instance entry from the orchestrator backed database.
+// ForgetCluster removes all instances of a cluster from the orchestrator backend database.
 // It may be auto-rediscovered through topology or requested for discovery by multiple means.
 func ForgetCluster(clusterName string) error {
-	clusterInstances, err := ReadClusterInstances(clusterName)
+	clusterInstances, err := forgetClusterRecords(clusterName)
 	if err != nil {
 		return err
 	}
-	if len(clusterInstances) == 0 {
-		return nil
+	for _, instance := range clusterInstances {
+		AuditOperation("forget", &instance.Key, "")
 	}
+	return nil
+}
+
+func forgetClusterRecords(clusterName string) ([]*Instance, error) {
+	releaseCluster := instanceWriteLocks.acquire([]string{clusterWriteLockKey(clusterName)}, true)
+	defer releaseCluster()
+
+	clusterInstances, err := ReadClusterInstances(clusterName)
+	if err != nil {
+		return nil, err
+	}
+	if len(clusterInstances) == 0 {
+		return clusterInstances, nil
+	}
+	keys := make([]string, 0, len(clusterInstances))
+	for _, instance := range clusterInstances {
+		keys = append(keys, instanceWriteLockKey(&instance.Key))
+	}
+	releaseInstances := instanceWriteLocks.acquire(keys, true)
+	defer releaseInstances()
 	for _, instance := range clusterInstances {
 		forgetInstanceKeys.Set(instance.Key.StringCode(), true, cache.DefaultExpiration)
-		AuditOperation("forget", &instance.Key, "")
 	}
 	_, err = db.ExecOrchestrator(`
 			delete
@@ -2898,7 +2958,10 @@ func ForgetCluster(clusterName string) error {
 				cluster_name = ?`,
 		clusterName,
 	)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return clusterInstances, nil
 }
 
 // ForgetLongUnseenInstances will remove entries of all instacnes that have long since been last seen.
